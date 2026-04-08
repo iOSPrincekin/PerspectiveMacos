@@ -1,13 +1,61 @@
 # PerspectiveMacos
 
-# 目的
+![Platform](https://img.shields.io/badge/platform-macOS-black)
+![Focus](https://img.shields.io/badge/focus-XNU%20%2F%20boot.efi-blue)
+![Status](https://img.shields.io/badge/status-in%20progress-orange)
 
-大家做iOS 或 macos 开发都很多年了，但是macos或 iOS 系统是如何编译如何运行的，大部分同学应该都还不清楚，笔者认为学习一个操作系统比较好的方式就是可以重新编译它并进行调试，枯燥的阅读源代码远没有添加自己的一些调试代码进行打印验证这个亲身参与来的深刻和透彻，介于水果的不开源政策，个人开发者想从源代码级别去重新编译达到可以添加自己的代码、并成功运行进行调试，难于登天，但是能重新编译修改macos 内核对于笔者有无尽的吸引力，遂公布自己的面向源码级别学习macos的成果，找到志同道合的人，共同进步，欣赏这个美妙的系统。
+> 一个面向源码级学习 macOS 的实验项目，目标是尽可能走通从启动链路到内核替换的关键路径。
 
-# 成果
+## 项目目标
 
-1.qemu 可以运行 macos11.4 BaseSystem.img，并进入macos 启动界面进入恢复模式, 基于 https://github.com/thenickdude/OSX-KVM 项目，已经成功；
+很多开发者做了多年 iOS 或 macOS 开发，但对系统究竟是如何编译、如何启动、如何运行，仍缺少从源码和运行时视角的完整理解。相比单纯阅读源码，能够亲手重新编译、替换关键组件并启动验证，往往更能建立深入认知。
 
-2.编写 自己 boot.efi 替换 macos11.4 BaseSystem.img 中的 System/Library/CoreServices/boot.efi 后，并进入macos 启动界面进入恢复模式，基于 https://github.com/acidanthera/OpenCorePkg ，已经成功；
+由于 Apple 系统并不开源到可直接完整重编译的程度，个人开发者若想真正做到源码级修改、构建、运行和调试，门槛极高。也正因为如此，重新编译并修改 macOS 内核这件事，才更具吸引力。
 
-3.使用 xnu-7195.121.3 源代码编译生成 对应的 kernel 文件，将编译得到的 kernel 代码重新映射到 System/Library/KernelCollections/BootKernelExtensions.kc 文件中，代替之前的内核代码，基于 https://github.com/PureDarwin/PureDarwin ,进行中
+这个仓库用于记录面向源码级学习 macOS 的实践成果，也希望借此找到志同道合的同学，一起探索这个精妙的系统。
+
+## 进展总览
+
+| 模块 | 目标说明 | 基于项目 | 当前状态 |
+| --- | --- | --- | --- |
+| `QEMU` 启动 | 运行 `macOS 11.4 BaseSystem.img`，进入启动界面并进入恢复模式 | [OSX-KVM](https://github.com/thenickdude/OSX-KVM) | `已完成` |
+| `boot.efi` 替换 | 编写并替换镜像中的 `System/Library/CoreServices/boot.efi`，成功进入启动界面与恢复模式 | [OpenCorePkg](https://github.com/acidanthera/OpenCorePkg) | `已完成` |
+| `XNU Kernel` 替换 | 基于 `xnu-7195.121.3` 编译对应 `kernel`，重新映射到 `System/Library/KernelCollections/BootKernelExtensions.kc` | [PureDarwin](https://github.com/PureDarwin/PureDarwin) | `进行中` |
+
+## 当前成果
+
+### 1. QEMU 启动 macOS BaseSystem
+
+- 已可在 `QEMU` 中运行 `macOS 11.4 BaseSystem.img`
+- 已成功进入 macOS 启动界面
+- 已可进入恢复模式
+
+### 2. 自定义 `boot.efi`
+
+- 已编写自己的 `boot.efi`
+- 已替换 `BaseSystem.img` 中的 `System/Library/CoreServices/boot.efi`
+- 替换后仍可正常进入启动界面和恢复模式
+
+### 3. 自定义 XNU 内核
+
+- 已基于 `xnu-7195.121.3` 源码编译生成对应 `kernel`
+- 正在将编译得到的内核重新映射到 `BootKernelExtensions.kc`
+- 目标是完成系统内核代码替换并继续验证启动链路
+
+## 这个项目在做什么
+
+| 方向 | 说明 |
+| --- | --- |
+| `启动链路` | 关注从引导加载到系统启动界面的关键流程 |
+| `组件替换` | 尝试替换 `boot.efi`、`kernel` 等核心组件 |
+| `源码级验证` | 通过修改、编译、启动、打印和调试来理解系统行为 |
+| `工程化复现` | 将探索过程沉淀为可复现的实验路径 |
+
+## 欢迎交流
+
+如果你也对以下方向感兴趣，欢迎一起交流：
+
+- macOS 启动流程
+- `boot.efi` 与引导阶段分析
+- XNU 内核编译与替换
+- 基于虚拟化的系统级调试与验证
