@@ -20,7 +20,7 @@
 | --- | --- | --- | --- |
 | `QEMU` 启动 | 运行 `macOS 11.4 BaseSystem.img`，进入启动界面并进入恢复模式 | [OSX-KVM](https://github.com/thenickdude/OSX-KVM) | `已完成` |
 | `boot.efi` 替换 | 编写并替换镜像中的 `System/Library/CoreServices/boot.efi`，成功进入启动界面与恢复模式 | [OpenCorePkg](https://github.com/acidanthera/OpenCorePkg) | `已完成` |
-| `boot.efi` 关闭内核ALSR | 关闭内核的加载地址的ALSR，使每次内核加载地址固定，方别调试 | [OpenCorePkg](https://github.com/acidanthera/OpenCorePkg) | `已完成` |
+| `boot.efi` 关闭内核ASLR | 关闭内核的加载地址的ASLR，使每次内核加载地址固定，方便调试 | [OpenCorePkg](https://github.com/acidanthera/OpenCorePkg) | `已完成` |
 | `XNU Kernel` 替换 | 基于 `xnu-7195.121.3` 编译对应 `kernel`，重新映射到 `System/Library/KernelCollections/BootKernelExtensions.kc` | [PureDarwin](https://github.com/PureDarwin/PureDarwin) | `进行中` |
 
 ## 当前成果
@@ -37,10 +37,10 @@
 - 已替换 `BaseSystem.img` 中的 `System/Library/CoreServices/boot.efi`
 - 替换后仍可正常进入启动界面和恢复模式
 
-### 3. 自定义 `boot.efi`
+### 3. `boot.efi` 关闭内核ASLR
 
-- 基于已编写自己的 `boot.efi`，关闭 内核的加载地址的ALSR
-- 以成功关闭，每次内核加载地址固定，使用LLDB 调试成功
+- 基于已编写自己的 `boot.efi`，关闭 内核的加载地址的ASLR
+- 已经成功关闭，每次内核加载地址固定，使用LLDB 调试成功
 
 ### 4. 自定义 XNU 内核
 
