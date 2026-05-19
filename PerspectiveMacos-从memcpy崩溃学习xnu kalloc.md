@@ -477,7 +477,7 @@ FFFFFF80002EC1B4  test    byte ptr [rdi+3Eh], 2    ; gzalloc_tracked (bit1)
 FFFFFF80002EC1B8  jnz     short loc_FFFFFF80002EC216 ; taken → gzalloc 路径
 
 ```
- 
+
  进行lldb调试，发现 apple 原生 BootKernelExtensions.kc 并没有调用 return zalloc_gz(zone, zstats, flags);
 
  ## 2.apple 原生 BootKernelExtensions.kc 为什么没有调用 return zalloc_gz(zone, zstats, flags); ？
@@ -651,6 +651,5 @@ Process 1 resuming
 ```
 返回的虚拟地址 addr 比 已经映射物理地址的 raw_addr 高了  esize * idx ，导致返回的虚拟地址 addr 没有 映射物理地址
 ```
-这种，需要进一步排查
-
+这种情况，需要进一步排查
 
