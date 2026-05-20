@@ -932,3 +932,484 @@ Target 1: (boot.efi) stopped.
 (lldb) 
 
 ```
+
+
+## 6.1.崩溃原因
+
+
+gzalloc_alloc (src/Kernel/xnu/osfmk/kern/gzalloc.c)
+```
+
+vm_offset_t
+gzalloc_alloc(zone_t zone, zone_stats_t zstats, zalloc_flags_t flags)
+{
+	vm_offset_t addr = 0;
+
+	assert(zone->gzalloc_tracked); // the caller is responsible for checking
+
+	if (get_preemption_level() != 0) {
+		if (flags & Z_NOWAIT) {
+			return 0;
+		}
+		pdzalloc_count++;
+	}
+
+	bool kmem_ready = (startup_phase >= STARTUP_SUB_KMEM);
+	vm_offset_t rounded_size = round_page(zone_elem_size(zone) + GZHEADER_SIZE);
+	vm_offset_t residue = rounded_size - zone_elem_size(zone);
+	vm_offset_t gzaddr = 0;
+	gzhdr_t *gzh, *gzhcopy = NULL;
+	bool new_va = false;
+
+	if (!kmem_ready || (vm_page_zone == ZONE_NULL)) {
+		/* Early allocations are supplied directly from the
+		 * reserve.
+		 */
+		if (gzalloc_reserve_size < (rounded_size + PAGE_SIZE)) {
+			panic("gzalloc reserve exhausted");
+		}
+		gzaddr = gzalloc_reserve;
+		/* No guard page for these early allocations, just
+		 * waste an additional page.
+		 */
+		gzalloc_reserve += rounded_size + PAGE_SIZE;
+		gzalloc_reserve_size -= rounded_size + PAGE_SIZE;
+		OSAddAtomic64((SInt32) (rounded_size), &gzalloc_early_alloc);
+	} else {
+		kern_return_t kr = kernel_memory_allocate(gzalloc_map,
+		    &gzaddr, rounded_size + (1 * PAGE_SIZE),
+		    0, KMA_KOBJECT | KMA_ATOMIC | gzalloc_guard,
+		    VM_KERN_MEMORY_OSFMK);
+		if (kr != KERN_SUCCESS) {
+			panic("gzalloc: kernel_memory_allocate for size 0x%llx failed with %d",
+			    (uint64_t)rounded_size, kr);
+		}
+		new_va = true;
+		(void)gzalloc_alloc_diag(zone, gzaddr, gzaddr, rounded_size,
+		    kmem_ready, new_va, "post-kma");
+	}
+
+	if (gzalloc_uf_mode) {
+		gzaddr += PAGE_SIZE;
+		/* The "header" becomes a "footer" in underflow
+		 * mode.
+		 */
+		gzh = (gzhdr_t *) (gzaddr + zone_elem_size(zone));
+		addr = gzaddr;
+		gzhcopy = (gzhdr_t *) (gzaddr + rounded_size - sizeof(gzhdr_t));
+	} else {
+		gzh = (gzhdr_t *) (gzaddr + residue - GZHEADER_SIZE);
+		addr = (gzaddr + residue);
+	}
+
+	if (zone->z_free_zeroes) {
+		bzero((void *)gzaddr, rounded_size);
+	} else {
+		/* Fill with a pattern on allocation to trap uninitialized
+		 * data use. Since the element size may be "rounded up"
+		 * by higher layers such as the kalloc layer, this may
+		 * also identify overruns between the originally requested
+		 * size and the rounded size via visual inspection.
+		 * TBD: plumb through the originally requested size,
+		 * prior to rounding by kalloc/IOMalloc etc.
+		 * We also add a signature and the zone of origin in a header
+		 * prefixed to the allocation.
+		 */
+		memset((void *)gzaddr, gzalloc_fill_pattern, rounded_size);
+	}
+
+	gzh->gzone = (kmem_ready && vm_page_zone) ? zone : GZDEADZONE;
+	gzh->gzsize = (uint32_t)zone_elem_size(zone);
+	gzh->gzsig = GZALLOC_SIGNATURE;
+
+	/* In underflow detection mode, stash away a copy of the
+	 * metadata at the edge of the allocated range, for
+	 * retrieval by gzalloc_element_size()
+	 */
+	if (gzhcopy) {
+		*gzhcopy = *gzh;
+	}
+
+	zone_lock(zone);
+	assert(zone->z_self == zone);
+	zone->z_elems_free--;
+	if (new_va) {
+		zone->z_va_cur += 1;
+	}
+	zone->z_wired_cur += 1;
+	zpercpu_get(zstats)->zs_mem_allocated += rounded_size;
+	zone_unlock(zone);
+
+	OSAddAtomic64((SInt32) rounded_size, &gzalloc_allocated);
+	OSAddAtomic64((SInt32) (rounded_size - zone_elem_size(zone)), &gzalloc_wasted);
+
+	(void)gzalloc_alloc_diag(zone, gzaddr, addr, rounded_size,
+	    kmem_ready, new_va, "return");
+
+	return addr;
+}
+```
+调试发现 进入的是 		
+
+if (zone->z_free_zeroes) {
+		bzero((void *)gzaddr, rounded_size);
+	} else {
+		/* Fill with a pattern on allocation to trap uninitialized
+		 * data use. Since the element size may be "rounded up"
+		 * by higher layers such as the kalloc layer, this may
+		 * also identify overruns between the originally requested
+		 * size and the rounded size via visual inspection.
+		 * TBD: plumb through the originally requested size,
+		 * prior to rounding by kalloc/IOMalloc etc.
+		 * We also add a signature and the zone of origin in a header
+		 * prefixed to the allocation.
+		 */
+		memset((void *)gzaddr, gzalloc_fill_pattern, rounded_size);
+	}
+中的 bzero((void *)gzaddr, rounded_size); 
+
+
+而 
+
+
+gzalloc_free (src/Kernel/xnu/osfmk/kern/gzalloc.c)
+
+```
+
+void
+gzalloc_free(zone_t zone, zone_stats_t zstats, void *addr)
+{
+	kern_return_t kr;
+
+	assert(zone->gzalloc_tracked); // the caller is responsible for checking
+
+	gzhdr_t *gzh;
+	vm_offset_t rounded_size = round_page(zone_elem_size(zone) + GZHEADER_SIZE);
+	vm_offset_t residue = rounded_size - zone_elem_size(zone);
+	vm_offset_t saddr;
+	vm_offset_t free_addr = 0;
+
+	if (gzalloc_uf_mode) {
+		gzh = (gzhdr_t *)((vm_offset_t)addr + zone_elem_size(zone));
+		saddr = (vm_offset_t) addr - PAGE_SIZE;
+	} else {
+		gzh = (gzhdr_t *)((vm_offset_t)addr - GZHEADER_SIZE);
+		saddr = ((vm_offset_t)addr) - residue;
+	}
+
+	if ((saddr & PAGE_MASK) != 0) {
+		panic("%s: invalid address supplied: "
+		    "%p (adjusted: 0x%lx) for zone with element sized 0x%lx\n",
+		    __func__, addr, saddr, zone_elem_size(zone));
+	}
+
+	if (gzfc_size && gzalloc_dfree_check) {
+		zone_lock(zone);
+		assert(zone->z_self == zone);
+		for (uint32_t gd = 0; gd < gzfc_size; gd++) {
+			if (zone->gz.gzfc[gd] != saddr) {
+				continue;
+			}
+			panic("%s: double free detected, freed address: 0x%lx, "
+			    "current free cache index: %d, freed index: %d",
+			    __func__, saddr, zone->gz.gzfc_index, gd);
+		}
+		zone_unlock(zone);
+	}
+
+	if (gzalloc_consistency_checks) {
+		if (gzh->gzsig != GZALLOC_SIGNATURE) {
+			panic("GZALLOC signature mismatch for element %p, "
+			    "expected 0x%x, found 0x%x",
+			    addr, GZALLOC_SIGNATURE, gzh->gzsig);
+		}
+
+		if (gzh->gzone != zone && (gzh->gzone != GZDEADZONE)) {
+			panic("%s: Mismatched zone or under/overflow, "
+			    "current zone: %p, recorded zone: %p, address: %p",
+			    __func__, zone, gzh->gzone, (void *)addr);
+		}
+		/* Partially redundant given the zone check, but may flag header corruption */
+		if (gzh->gzsize != zone_elem_size(zone)) {
+			panic("Mismatched zfree or under/overflow for zone %p, "
+			    "recorded size: 0x%x, element size: 0x%x, address: %p",
+			    zone, gzh->gzsize, (uint32_t)zone_elem_size(zone), (void *)addr);
+		}
+
+		char *gzc, *checkstart, *checkend;
+		if (gzalloc_uf_mode) {
+			checkstart = (char *) ((uintptr_t) gzh + sizeof(gzh));
+			checkend = (char *) ((((vm_offset_t)addr) & ~PAGE_MASK) + PAGE_SIZE);
+		} else {
+			checkstart = (char *) trunc_page_64(addr);
+			checkend = (char *)gzh;
+		}
+
+		for (gzc = checkstart; gzc < checkend; gzc++) {
+			if (*gzc == gzalloc_fill_pattern) {
+				continue;
+			}
+			panic("%s: detected over/underflow, byte at %p, element %p, "
+			    "contents 0x%x from 0x%lx byte sized zone (%s%s) "
+			    "doesn't match fill pattern (%c)",
+			    __func__, gzc, addr, *gzc, zone_elem_size(zone),
+			    zone_heap_name(zone), zone->z_name, gzalloc_fill_pattern);
+		}
+	}
+
+	if ((startup_phase < STARTUP_SUB_KMEM) || gzh->gzone == GZDEADZONE) {
+		/* For now, just leak frees of early allocations
+		 * performed before kmem is fully configured.
+		 * They don't seem to get freed currently;
+		 * consider ml_static_mfree in the future.
+		 */
+		OSAddAtomic64((SInt32) (rounded_size), &gzalloc_early_free);
+		return;
+	}
+
+	if (get_preemption_level() != 0) {
+		pdzfree_count++;
+	}
+
+	if (gzfc_size) {
+		/* Either write protect or unmap the newly freed
+		 * allocation
+		 */
+		kr = vm_map_protect(gzalloc_map, saddr,
+		    saddr + rounded_size + (1 * PAGE_SIZE),
+		    gzalloc_prot, FALSE);
+		if (kr != KERN_SUCCESS) {
+			panic("%s: vm_map_protect: %p, 0x%x", __func__, (void *)saddr, kr);
+		}
+	} else {
+		free_addr = saddr;
+	}
+
+	zone_lock(zone);
+	assert(zone->z_self == zone);
+
+	/* Insert newly freed element into the protected free element
+	 * cache, and rotate out the LRU element.
+	 */
+	if (gzfc_size) {
+		if (zone->gz.gzfc_index >= gzfc_size) {
+			zone->gz.gzfc_index = 0;
+		}
+		free_addr = zone->gz.gzfc[zone->gz.gzfc_index];
+		zone->gz.gzfc[zone->gz.gzfc_index++] = saddr;
+	}
+
+	if (free_addr) {
+		zone->z_elems_free++;
+		zone->z_wired_cur -= 1;
+	}
+
+	zpercpu_get(zstats)->zs_mem_freed += rounded_size;
+	zone_unlock(zone);
+
+	if (free_addr) {
+		// TODO: consider using physical reads to check for
+		// corruption while on the protected freelist
+		// (i.e. physical corruption)
+		kr = vm_map_remove(gzalloc_map, free_addr,
+		    free_addr + rounded_size + (1 * PAGE_SIZE),
+		    VM_MAP_REMOVE_KUNWIRE);
+		if (kr != KERN_SUCCESS) {
+			panic("gzfree: vm_map_remove: %p, 0x%x", (void *)free_addr, kr);
+		}
+		// TODO: sysctl-ize for quick reference
+		OSAddAtomic64((SInt32)rounded_size, &gzalloc_freed);
+		OSAddAtomic64(-((SInt32) (rounded_size - zone_elem_size(zone))),
+		    &gzalloc_wasted);
+	}
+}
+
+
+
+```
+
+确实按照 			if (*gzc == gzalloc_fill_pattern) { 进行溢出校验，两处设计不一致导致触发了 panic
+
+## 6.2 修复
+
+
+根据 zone->z_free_zeroes  做对应的校验
+
+
+用 expected = zone->z_free_zeroes ? 0 : gzalloc_fill_pattern 统一判断 *gzc == expected
+
+修改后的代码
+
+
+gzalloc_free (src/Kernel/xnu/osfmk/kern/gzalloc.c)
+
+```
+
+void
+gzalloc_free(zone_t zone, zone_stats_t zstats, void *addr)
+{
+	kern_return_t kr;
+
+	assert(zone->gzalloc_tracked); // the caller is responsible for checking
+
+	gzhdr_t *gzh;
+	vm_offset_t rounded_size = round_page(zone_elem_size(zone) + GZHEADER_SIZE);
+	vm_offset_t residue = rounded_size - zone_elem_size(zone);
+	vm_offset_t saddr;
+	vm_offset_t free_addr = 0;
+
+	if (gzalloc_uf_mode) {
+		gzh = (gzhdr_t *)((vm_offset_t)addr + zone_elem_size(zone));
+		saddr = (vm_offset_t) addr - PAGE_SIZE;
+	} else {
+		gzh = (gzhdr_t *)((vm_offset_t)addr - GZHEADER_SIZE);
+		saddr = ((vm_offset_t)addr) - residue;
+	}
+
+	if ((saddr & PAGE_MASK) != 0) {
+		panic("%s: invalid address supplied: "
+		    "%p (adjusted: 0x%lx) for zone with element sized 0x%lx\n",
+		    __func__, addr, saddr, zone_elem_size(zone));
+	}
+
+	if (gzfc_size && gzalloc_dfree_check) {
+		zone_lock(zone);
+		assert(zone->z_self == zone);
+		for (uint32_t gd = 0; gd < gzfc_size; gd++) {
+			if (zone->gz.gzfc[gd] != saddr) {
+				continue;
+			}
+			panic("%s: double free detected, freed address: 0x%lx, "
+			    "current free cache index: %d, freed index: %d",
+			    __func__, saddr, zone->gz.gzfc_index, gd);
+		}
+		zone_unlock(zone);
+	}
+
+	if (gzalloc_consistency_checks) {
+		if (gzh->gzsig != GZALLOC_SIGNATURE) {
+			panic("GZALLOC signature mismatch for element %p, "
+			    "expected 0x%x, found 0x%x",
+			    addr, GZALLOC_SIGNATURE, gzh->gzsig);
+		}
+
+		if (gzh->gzone != zone && (gzh->gzone != GZDEADZONE)) {
+			panic("%s: Mismatched zone or under/overflow, "
+			    "current zone: %p, recorded zone: %p, address: %p",
+			    __func__, zone, gzh->gzone, (void *)addr);
+		}
+		/* Partially redundant given the zone check, but may flag header corruption */
+		if (gzh->gzsize != zone_elem_size(zone)) {
+			panic("Mismatched zfree or under/overflow for zone %p, "
+			    "recorded size: 0x%x, element size: 0x%x, address: %p",
+			    zone, gzh->gzsize, (uint32_t)zone_elem_size(zone), (void *)addr);
+		}
+
+		char *gzc, *checkstart, *checkend;
+		if (gzalloc_uf_mode) {
+			checkstart = (char *) ((uintptr_t) gzh + sizeof(gzh));
+			checkend = (char *) ((((vm_offset_t)addr) & ~PAGE_MASK) + PAGE_SIZE);
+		} else {
+			checkstart = (char *) trunc_page_64(addr);
+			checkend = (char *)gzh;
+		}
+
+		/*
+		 * Match gzalloc_alloc: z_free_zeroes zones are bzero'd,
+		 * others are filled with gzalloc_fill_pattern.
+		 */
+		const char expected = zone->z_free_zeroes ? 0 : gzalloc_fill_pattern;
+
+		for (gzc = checkstart; gzc < checkend; gzc++) {
+			if (*gzc == expected) {
+				continue;
+			}
+			if (zone->z_free_zeroes) {
+				panic("%s: detected over/underflow, byte at %p, element %p, "
+				    "contents 0x%x from 0x%lx byte sized zone (%s%s) "
+				    "doesn't match expected redzone (zeroed)",
+				    __func__, gzc, addr, (unsigned)*gzc,
+				    zone_elem_size(zone),
+				    zone_heap_name(zone), zone->z_name);
+			} else {
+				panic("%s: detected over/underflow, byte at %p, element %p, "
+				    "contents 0x%x from 0x%lx byte sized zone (%s%s) "
+				    "doesn't match fill pattern (%c)",
+				    __func__, gzc, addr, (unsigned)*gzc,
+				    zone_elem_size(zone),
+				    zone_heap_name(zone), zone->z_name,
+				    gzalloc_fill_pattern);
+			}
+		}
+	}
+
+	if ((startup_phase < STARTUP_SUB_KMEM) || gzh->gzone == GZDEADZONE) {
+		/* For now, just leak frees of early allocations
+		 * performed before kmem is fully configured.
+		 * They don't seem to get freed currently;
+		 * consider ml_static_mfree in the future.
+		 */
+		OSAddAtomic64((SInt32) (rounded_size), &gzalloc_early_free);
+		return;
+	}
+
+	if (get_preemption_level() != 0) {
+		pdzfree_count++;
+	}
+
+	if (gzfc_size) {
+		/* Either write protect or unmap the newly freed
+		 * allocation
+		 */
+		kr = vm_map_protect(gzalloc_map, saddr,
+		    saddr + rounded_size + (1 * PAGE_SIZE),
+		    gzalloc_prot, FALSE);
+		if (kr != KERN_SUCCESS) {
+			panic("%s: vm_map_protect: %p, 0x%x", __func__, (void *)saddr, kr);
+		}
+	} else {
+		free_addr = saddr;
+	}
+
+	zone_lock(zone);
+	assert(zone->z_self == zone);
+
+	/* Insert newly freed element into the protected free element
+	 * cache, and rotate out the LRU element.
+	 */
+	if (gzfc_size) {
+		if (zone->gz.gzfc_index >= gzfc_size) {
+			zone->gz.gzfc_index = 0;
+		}
+		free_addr = zone->gz.gzfc[zone->gz.gzfc_index];
+		zone->gz.gzfc[zone->gz.gzfc_index++] = saddr;
+	}
+
+	if (free_addr) {
+		zone->z_elems_free++;
+		zone->z_wired_cur -= 1;
+	}
+
+	zpercpu_get(zstats)->zs_mem_freed += rounded_size;
+	zone_unlock(zone);
+
+	if (free_addr) {
+		// TODO: consider using physical reads to check for
+		// corruption while on the protected freelist
+		// (i.e. physical corruption)
+		kr = vm_map_remove(gzalloc_map, free_addr,
+		    free_addr + rounded_size + (1 * PAGE_SIZE),
+		    VM_MAP_REMOVE_KUNWIRE);
+		if (kr != KERN_SUCCESS) {
+			panic("gzfree: vm_map_remove: %p, 0x%x", (void *)free_addr, kr);
+		}
+		// TODO: sysctl-ize for quick reference
+		OSAddAtomic64((SInt32)rounded_size, &gzalloc_freed);
+		OSAddAtomic64(-((SInt32) (rounded_size - zone_elem_size(zone))),
+		    &gzalloc_wasted);
+	}
+}
+
+```
+
+重新编译测试，不再触发 同一个 panic ，解决了！
