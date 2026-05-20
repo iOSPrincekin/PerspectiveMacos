@@ -653,3 +653,282 @@ Process 1 resuming
 ```
 这种情况，需要进一步排查
 
+
+## 5.1.发现问题
+
+
+zalloc_gz (src/Kernel/xnu/osfmk/kern/zalloc.c)
+
+```
+
+/*!
+ * @function zalloc_gz
+ *
+ * @brief
+ * Performs allocations for zones using gzalloc.
+ *
+ * @discussion
+ * This function is noinline so that it doesn't affect the codegen
+ * of the fastpath.
+ */
+__attribute__((noinline))
+static void *
+zalloc_gz(zone_t zone, zone_stats_t zstats, zalloc_flags_t flags)
+{
+	vm_offset_t addr = gzalloc_alloc(zone, zstats, flags);
+	return zalloc_return(zone, zone_element_encode(addr, 0, ZPM_AUTO),
+	           flags, zone_elem_size(zone), NULL);
+}
+
+```
+
+上面xnu 源代码 中的 zone_element_encode(addr, 0, ZPM_AUTO) 不符合 xnu 设计
+
+
+zone_element_t (src/Kernel/xnu/osfmk/kern/zalloc.c)
+
+
+```
+
+/*!
+ * @typedef zone_element_t
+ *
+ * @brief
+ * Type that represents a "resolved" zone element.
+ *
+ * @description
+ * This type encodes an element pointer as a tuple of:
+ * { chunk base, element index, element protection }.
+ *
+ * The chunk base is extracted with @c trunc_page()
+ * as it is always page aligned, and occupies the bits above @c PAGE_SHIFT.
+ *
+ * The low two bits encode the protection mode (see @c zprot_mode_t).
+ *
+ * The other bits encode the element index in the chunk rather than its address.
+ */
+typedef struct zone_element {
+	vm_offset_t                 ze_value;
+} zone_element_t;
+
+```
+
+设计中明确说了 使用 chunk base 和 element index ，而   zone_element_encode(addr, 0, ZPM_AUTO) 却 使用了原地址 addr 和 element index = 0； 
+
+从其他调用的地方也可以佐证这一点
+
+zone_element_resolve (src/Kernel/xnu/osfmk/kern/zalloc.c)
+
+```
+
+__attribute__((always_inline))
+static struct zone_page_metadata *
+zone_element_resolve(zone_t zone, vm_offset_t addr, vm_offset_t esize,
+    zone_element_t *ze)
+{
+	struct zone_page_metadata *meta;
+	vm_offset_t page, eidx;
+
+	if (!from_zone_map(addr, esize, ZONE_ADDR_NATIVE) &&
+	    !from_zone_map(addr, esize, ZONE_ADDR_FOREIGN)) {
+		zone_invalid_element_addr_panic(zone, addr);
+	}
+	page = trunc_page(addr);
+	meta = zone_meta_from_addr(addr);
+
+	if (meta->zm_chunk_len == ZM_SECONDARY_PCPU_PAGE) {
+		zone_invalid_element_addr_panic(zone, addr);
+	}
+	if (meta->zm_chunk_len == ZM_SECONDARY_PAGE) {
+		page -= ptoa(meta->zm_page_index);
+		meta -= meta->zm_page_index;
+	}
+
+	eidx = (addr - page) / esize;
+	if ((addr - page) % esize) {
+		zone_invalid_element_addr_panic(zone, addr);
+	}
+
+	if (!zone_has_index(zone, meta->zm_index)) {
+		zone_page_metadata_index_confusion_panic(zone, addr, meta);
+	}
+
+	*ze = zone_element_encode(page, eidx, ZPM_AUTO);
+	return meta;
+}
+
+```
+
+
+zalloc_import (src/Kernel/xnu/osfmk/kern/zalloc.c)
+
+```
+
+/*!
+ * @function zalloc_import
+ *
+ * @brief
+ * Import @c n elements in the specified array, opposite of @c zfree_drop().
+ *
+ * @param zone          The zone to import elements from
+ * @param elems         The array to import into
+ * @param n             The number of elements to import. Must be non zero,
+ *                      and smaller than @c zone->z_elems_free.
+ */
+__header_always_inline void
+zalloc_import(zone_t zone, zone_element_t *elems, uint32_t n)
+{
+	vm_size_t esize = zone_elem_size(zone);
+	uint32_t i = 0;
+
+	assertf(STAILQ_EMPTY(&zone->z_recirc),
+	    "Trying to import from zone %p [%s%s] with non empty recirc",
+	    zone, zone_heap_name(zone), zone_name(zone));
+
+	do {
+		vm_offset_t page, eidx, size = 0;
+		struct zone_page_metadata *meta;
+
+		if (!zone_pva_is_null(zone->z_pageq_partial)) {
+			meta = zone_pva_to_meta(zone->z_pageq_partial);
+			page = zone_pva_to_addr(zone->z_pageq_partial);
+		} else if (!zone_pva_is_null(zone->z_pageq_empty)) {
+			meta = zone_pva_to_meta(zone->z_pageq_empty);
+			page = zone_pva_to_addr(zone->z_pageq_empty);
+			zone_counter_sub(zone, z_wired_empty, meta->zm_chunk_len);
+		} else {
+			zone_accounting_panic(zone, "z_elems_free corruption");
+		}
+
+		if (!zone_has_index(zone, meta->zm_index)) {
+			zone_page_metadata_index_confusion_panic(zone, page, meta);
+		}
+
+		vm_offset_t old_size = meta->zm_alloc_size;
+		vm_offset_t max_size = ptoa(meta->zm_chunk_len) + ZM_ALLOC_SIZE_LOCK;
+
+		do {
+			eidx = zone_meta_find_and_clear_bit(zone, meta);
+			elems[i++] = zone_element_encode(page, eidx, ZPM_AUTO);
+			size += esize;
+		} while (i < n && old_size + size + esize <= max_size);
+
+		vm_offset_t new_size = zone_meta_alloc_size_add(zone, meta, size);
+
+		if (new_size + esize > max_size) {
+			zone_meta_requeue(zone, &zone->z_pageq_full, meta);
+		} else if (old_size == 0) {
+			/* remove from free, move to intermediate */
+			zone_meta_requeue(zone, &zone->z_pageq_partial, meta);
+		}
+	} while (i < n);
+}
+
+
+```
+
+## 5.2.调整为正确的方式
+
+修改后的 
+
+
+zalloc_gz (src/Kernel/xnu/osfmk/kern/zalloc.c)
+
+```
+
+__attribute__((noinline))
+static void *
+zalloc_gz(zone_t zone, zone_stats_t zstats, zalloc_flags_t flags)
+{
+	vm_size_t esize = zone_elem_size(zone);
+	vm_offset_t addr = gzalloc_alloc(zone, zstats, flags);
+	vm_offset_t page = trunc_page(addr);
+	vm_offset_t eidx = (addr - page) / esize;
+	zone_element_t ze = zone_element_encode(page, eidx, ZPM_AUTO);
+	vm_offset_t returnAddr = zalloc_return(zone, ze, flags, esize, NULL);
+
+	if (zalloc_gz_trace_enabled()) {
+		kprintf("zalloc_gz: zone=%p (%s%s) zstats=%p flags=0x%x esize=0x%lx\n",
+		    zone, zone_heap_name(zone), zone->z_name, zstats, flags,
+		    (unsigned long)esize);
+		kprintf("  addr(raw)=%p page=%p page_off=0x%lx eidx=0x%lx\n",
+		    (void *)addr, (void *)page, (unsigned long)(addr - page),
+		    (unsigned long)eidx);
+		kprintf("  ze=0x%llx returnAddr=%p (delta=0x%llx)\n",
+		    (unsigned long long)ze.ze_value, (void *)returnAddr,
+		    (unsigned long long)(returnAddr - addr));
+	}
+
+	return (void *)returnAddr;
+}
+
+```
+
+
+	zone_element_t ze = zone_element_encode(page, eidx, ZPM_AUTO);
+
+中使用了 page(chunk base), eidx(element index)  ,修改后的打印如下：
+
+```
+
+
+  gzalloc_map=[0xffffffa019a6d000,0xffffffc019a6d000) in_map=1 vm_entry=1 entry=[0xffffffa019a6d000,0xffffffa019a6f000) wired=1 prot=0x3 caller=0xffffff80103bb200 thread=0xffffff80112d3b50 preempt=0 -> ok
+gzalloc_alloc[return]: zone=kalloc.1024 esize=0x400 gzaddr=0xffffffa019a6d000 addr=0xffffffa019a6dc00 rounded=0x1000 path=gzalloc_map new_va=1 kmem_ready=1 startup=13
+  pmap: elem=0x17816d elem_end=0x17816d gzaddr=0x17816d guard@0xffffffa019a6e000=0x0 diag=0x7f
+  gzalloc_map=[0xffffffa019a6d000,0xffffffc019a6d000) in_map=1 vm_entry=1 entry=[0xffffffa019a6d000,0xffffffa019a6f000) wired=1 prot=0x3 caller=0xffffff80103bb47d thread=0xffffff80112d3b50 preempt=0 -> ok
+zalloc_return[gzalloc]: zone=default.kalloc.1024 esize=0x400
+  ze=0xffffffa019a6d00c page=0xffffffa019a6d000 page_off=0xc eidx_from_ze=0x3
+  encode-as-raw est=0xffffffa019a6d00c zone_element_addr=>0xffffffa019a6dc00 delta=0xbf4 MISMATCH
+  fix: encode(page,eidx=0) would decode to 0xffffffa019a6d000
+zalloc_gz: zone=0xffffff8011125d90 (default.kalloc.1024) zstats=0x7fffff8019a6d2d0 flags=0x0 esize=0x400
+  addr(raw)=0xffffffa019a6dc00 page=0xffffffa019a6d000 page_off=0xc00 eidx=0x3
+  ze=0xffffffa019a6d00c returnAddr=0xffffffa019a6dc00 (delta=0x0)
+
+```
+可以看到变化：
+
+  addr(raw)=0xffffffa019a6dc00 -> ze=0xffffffa019a6d00c -> returnAddr=0xffffffa019a6dc00 (delta=0x0)
+
+
+解决了：返回的虚拟地址 addr 比 已经映射物理地址的 raw_addr 高了 esize * idx ，导致返回的虚拟地址 addr 没有 映射物理地址
+
+
+# 6.新的崩溃
+
+
+```
+
+
+Process 1 stopped
+* thread #1, stop reason = breakpoint 7.1 8.1
+    frame #0: 0xffffff8010eda340 kernel.debug`panic(str="\"%s: detected over/underflow, byte at %p, element %p, \" \"contents 0x%x from 0x%lx byte sized zone (%s%s) \" \"doesn't match fill pattern (%c)\"@/Users/lee/Desktop/Computer_Systems/Macos/PureDarwin/src/Kernel/xnu/osfmk/kern/gzalloc.c:675") at debug.c:800:10
+   797 	void
+   798 	panic(const char *str, ...)
+   799 	{
+-> 800 		va_list panic_str_args;
+   801 	
+   802 		va_start(panic_str_args, str);
+   803 		panic_trap_to_debugger(str, &panic_str_args, 0, NULL, 0, NULL, (unsigned long)(char *)__builtin_return_address(0));
+kernel.debug`panic:
+->  0xffffff8010eda340 <+96>:  movq   $0x0, -0x10(%rbp)
+    0xffffff8010eda348 <+104>: movq   $0x0, -0x18(%rbp)
+    0xffffff8010eda350 <+112>: movq   $0x0, -0x20(%rbp)
+    0xffffff8010eda358 <+120>: leaq   -0xd0(%rbp), %rax
+Target 1: (boot.efi) stopped.
+(lldb) bt
+* thread #1, stop reason = breakpoint 7.1 8.1
+  * frame #0: 0xffffff8010eda340 kernel.debug`panic(str="\"%s: detected over/underflow, byte at %p, element %p, \" \"contents 0x%x from 0x%lx byte sized zone (%s%s) \" \"doesn't match fill pattern (%c)\"@/Users/lee/Desktop/Computer_Systems/Macos/PureDarwin/src/Kernel/xnu/osfmk/kern/gzalloc.c:675") at debug.c:800:10
+    frame #1: 0xffffff80103bbf2e kernel.debug`gzalloc_free(zone=0xffffff8011125d90, zstats=0x7fffff80198c42d0, addr=0xffffffa0198c4c00) at gzalloc.c:671:4
+    frame #2: 0xffffff80103a3092 kernel.debug`zfree_ext(zone=0xffffff8011125d90, zstats=0x7fffff80198c42d0, addr=0xffffffa0198c4c00) at zalloc.c:5571:10
+    frame #3: 0xffffff8010314717 kernel.debug`kfree_ext(kheap=0x0000000000000000, data=0xffffffa0198c4c00, size=896) at kalloc.c:1216:2
+    frame #4: 0xffffff8010314432 kernel.debug`kfree(addr=0xffffffa0198c4c00, size=896) at kalloc.c:1225:2
+    frame #5: 0xffffff80103163d8 kernel.debug`ledger_entry_add(template=0xffffff934cbe6ac0, key="alternate_accounting_compressed", group="physmem", units="bytes") at ledger.c:322:3
+    frame #6: 0xffffff8010356d40 kernel.debug`init_task_ledgers at task.c:1058:49
+    frame #7: 0xffffff80102f82b5 kernel.debug`coalitions_init at coalition.c:2066:2
+    frame #8: 0xffffff8010350a88 kernel.debug`kernel_bootstrap at startup.c:477:2
+    frame #9: 0xffffff8010581d5e kernel.debug`machine_startup at model_dep.c:332:2
+    frame #10: 0xffffff8010558334 kernel.debug`i386_init at i386_init.c:1118:2
+    frame #11: 0xffffff801056ae28 kernel.debug`x86_init_wrapper + 8
+(lldb) 
+
+```
