@@ -1,67 +1,55 @@
-# PerspectiveMacos
+---
+title: Build Your Own macOS Kernel — Results
+title_zh: 编译自己的 macOS 内核——成果篇
+slug: build-your-own-macos-kernel-results
+date: 2026-11-11 22:34:01
+categories:
+tags:
+description:
+---
 
-![Platform](https://img.shields.io/badge/platform-macOS-black)
-![Focus](https://img.shields.io/badge/focus-XNU%20%2F%20boot.efi-blue)
-![Status](https://img.shields.io/badge/status-in%20progress-orange)
+## Background
 
-> 一个面向源码级学习 macOS 的实验项目，目标是尽可能走通从启动链路到内核替换的关键路径。
+macOS is an excellent operating system, yet many iOS and macOS developers only encounter operating-system internals in documentation. Working directly with the macOS kernel source is difficult and demanding. After a long investigation, I completed that journey and built a macOS system with my own startup program and kernel.
 
-## 项目目标
+## Results
 
-很多开发者做了多年 iOS 或 macOS 开发，但对系统究竟是如何编译、如何启动、如何运行，仍缺少从源码和运行时视角的完整理解，现在找工作这么卷，工作多年还在停留在表层开发，无法深入的理解底层代码对开发者来说是很不公平的。相比单纯阅读源码，能够亲手重新编译、替换关键组件并启动验证，往往更能建立深入认知。
+![macOS 11.4 successfully booted with a custom boot.efi and XNU kernel](custom-macos-kernel-boot-success.png)
 
-由于 Apple 系统不是完全开源，个人开发者若想真正做到源码级修改、构建、运行和调试，门槛极高。也正因为如此，重新编译并修改 macOS 内核这件事，才更具吸引力。
+The screenshot shows macOS running with my compiled versions of `/System/Library/CoreServices/boot.efi` and `/System/Library/KernelCollections/BootKernelExtensions.kc`, two protected components that cannot normally be replaced in a standard system.
 
-这个仓库用于记录面向源码级学习 macOS 的实践成果，也希望借此找到志同道合的同学，一起探索这个精妙的系统。
+### Project Status
 
-## 进展总览
+The table below separates completed results from the work that remains. To avoid ambiguity, installing Apple's original macOS on real hardware is listed separately from running the custom kernel on real hardware.
 
-| 模块 | 目标说明 | 基于项目 | 当前状态 |
-| --- | --- | --- | --- |
-| `QEMU` 启动 | 运行 `macOS 11.4 BaseSystem.img`，进入启动界面并进入恢复模式 | [OSX-KVM](https://github.com/thenickdude/OSX-KVM) | `已完成` |
-| `boot.efi` 替换 | 编写并替换镜像中的 `System/Library/CoreServices/boot.efi`，成功进入启动界面与恢复模式 | [OpenCorePkg](https://github.com/acidanthera/OpenCorePkg) | `已完成` |
-| `boot.efi` 关闭内核ASLR | 关闭内核的加载地址的ASLR，使每次内核加载地址固定，方便调试 | [OpenCorePkg](https://github.com/acidanthera/OpenCorePkg) | `已完成` |
-| `XNU Kernel` 替换 | 基于 `xnu-7195.121.3` 编译对应 `kernel`，重新映射到 `System/Library/KernelCollections/BootKernelExtensions.kc` | [PureDarwin](https://github.com/PureDarwin/PureDarwin) | `进行中` |
+| Status | Item | Notes |
+| :---: | --- | --- |
+| ✅ | Compile a custom `boot.efi` for macOS 11.4 | The system startup program has been compiled, modified, and debugged. |
+| ✅ | Compile a custom XNU kernel for macOS 11.4 | The kernel has been built and debugged from the XNU source corresponding to macOS 11.4. |
+| ✅ | Generate a custom kernel cache | The custom XNU kernel and related system components have been packaged into the cache required to boot macOS. |
+| ✅ | Fix custom-kernel boot failures | Several low-level compatibility and data-validation issues that stopped the system from booting have been resolved. |
+| ✅ | Build and configure the OpenCore environment | The boot environment can load the custom startup program and kernel in a virtual machine. |
+| ✅ | Boot macOS 11.4 with the custom startup program and kernel | The system successfully reaches the macOS desktop in a virtual machine. |
+| ✅ | Create a macOS 11.4 installer containing the custom kernel | The custom startup program, kernel, and kernel cache have been integrated into an installation image. |
+| ✅ | Complete installation from the custom image | The complete path from booting the installer and installing to disk through first-boot setup has succeeded. |
+| ✅ | Complete first-boot setup and enter the desktop | A user account was created successfully, and system applications including Finder and Safari run normally. |
+| ✅ | Verify the installed custom system files | The startup program and kernel cache used by the installed system match the custom build outputs. |
+| ✅ | Enter the macOS recovery environment | The macOS recovery environment boots successfully in a virtual machine. |
+| ✅ | Install Apple's original macOS 11.4 on a physical Mac | The original system was installed on a Late 2013 13-inch MacBook Pro and reached the desktop. This does not mean the custom kernel has run on real hardware. |
+| ❌ | Install and run the custom kernel on a physical Mac laptop | The custom startup program and kernel have only been verified in a virtual machine; physical-Mac installation and boot remain unverified. |
+| ❌ | Install and run the custom macOS system on a Windows PC | Adaptation and installation for PC processors, graphics, motherboards, storage, and other hardware have not yet been completed. |
+| ❌ | Complete physical-hardware driver support | Graphics, audio, networking, USB, power management, sleep, and wake must still be verified on target hardware. |
+| ❌ | Complete compatibility testing across multiple computers | Full installation and stability testing has not yet been performed across multiple Mac and Windows PC models. |
 
-## 当前成果
+> The central result is complete: the custom startup program, XNU kernel, and kernel cache have passed the full compile, install, boot, and desktop workflow in a virtual machine. The next milestone is adapting and validating the system on physical hardware.
 
-### 1. QEMU 启动 macOS BaseSystem
 
-- 已可在 `QEMU` 中运行 `macOS 11.4 BaseSystem.img`
-- 已成功进入 macOS 启动界面
-- 已可进入恢复模式
 
-### 2. 自定义 `boot.efi`
 
-- 已编写自己的 `boot.efi`
-- 已替换 `BaseSystem.img` 中的 `System/Library/CoreServices/boot.efi`
-- 替换后仍可正常进入启动界面和恢复模式
 
-### 3. `boot.efi` 关闭内核ASLR
 
-- 基于已编写自己的 `boot.efi`，关闭 内核的加载地址的ASLR
-- 已经成功关闭，每次内核加载地址固定，使用LLDB 调试成功
 
-### 4. 自定义 XNU 内核
 
-- 已基于 `xnu-7195.121.3` 源码编译生成对应 `kernel`
-- 正在将编译得到的内核重新映射到 `BootKernelExtensions.kc`
-- 目标是完成系统内核代码替换并继续验证启动链路
 
-## 这个项目在做什么
 
-| 方向 | 说明 |
-| --- | --- |
-| `启动链路` | 关注从引导加载到系统启动界面的关键流程 |
-| `组件替换` | 尝试替换 `boot.efi`、`kernel` 等核心组件 |
-| `源码级验证` | 通过修改、编译、启动、打印和调试来理解系统行为 |
-| `工程化复现` | 将探索过程沉淀为可复现的实验路径 |
 
-## 欢迎交流
-
-如果你也对以下方向感兴趣，欢迎一起交流：
-
-- macOS 启动流程
-- `boot.efi` 重编译与引导阶段分析
-- XNU 内核重编译与替换
-- 基于虚拟化的系统级调试与验证
