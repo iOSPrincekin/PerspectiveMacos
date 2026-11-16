@@ -14,7 +14,7 @@ macOS is an excellent operating system, yet many iOS and macOS developers only e
 
 ## Results
 
-![macOS 11.4 successfully booted with a custom boot.efi and XNU kernel](custom-macos-kernel-boot-success.png)
+![macOS 11.4 successfully booted with a custom boot.efi and XNU kernel](https://github.com/iOSPrincekin/PerspectiveMacos/blob/main/build-your-own-macos-kernel-results/custom-macos-kernel-boot-success.png)
 
 The screenshot shows macOS running with my compiled versions of `/System/Library/CoreServices/boot.efi` and `/System/Library/KernelCollections/BootKernelExtensions.kc`, two protected components that cannot normally be replaced in a standard system.
 
